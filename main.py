@@ -491,7 +491,7 @@ def select_port_callback(event=None):
 def _build_fleet_col(parent):
     col = ttk.Frame(parent)
 
-    ttk.Label(col, text="Fleet Operations", font=("TkDefaultFont", 10, "bold")).pack(
+    ttk.Label(col, text="Module Operations", font=("TkDefaultFont", 10, "bold")).pack(
         padx=4, pady=(4, 4), anchor=tk.W
     )
 
