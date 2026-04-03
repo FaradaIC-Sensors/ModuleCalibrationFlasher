@@ -1,4 +1,5 @@
 import serial
+from contextlib import contextmanager
 
 from client import build_empty_read_frame
 from protocol import (
@@ -46,45 +47,69 @@ def _expected_ack_kind(frame, operation):
     return None
 
 
+@contextmanager
+def open_connection(port):
+    ser = serial.Serial(port, 115200, timeout=SERIAL_TIMEOUT_S)
+    try:
+        ser.reset_input_buffer()
+        yield ser
+    finally:
+        ser.close()
+
+
+def ping_on_connection(ser):
+    try:
+        ser.reset_input_buffer()
+        frame = build_empty_read_frame()
+        ser.write(bytes(frame))
+
+        response_bytes = _read_response_frame(ser)
+        parsed = parse_response(response_bytes)
+        if not parsed:
+            return False
+        return parsed["kind"] in (RESPONSE_READY, RESPONSE_ACK_SHORT)
+
+    except (serial.SerialException, serial.SerialTimeoutException):
+        return False
+
+
+def send_frame_on_connection(ser, frame, operation):
+    try:
+        ser.reset_input_buffer()
+        ser.write(bytes(frame))
+
+        response_bytes = _read_response_frame(ser)
+        if not response_bytes:
+            return False, []
+
+        parsed = parse_response(response_bytes)
+        if not parsed:
+            return False, response_bytes
+
+        if parsed["kind"] == RESPONSE_NACK:
+            return False, response_bytes
+
+        expected_ack_kind = _expected_ack_kind(frame, operation)
+        if parsed["kind"] != expected_ack_kind:
+            return False, response_bytes
+
+        return True, response_bytes
+
+    except (serial.SerialException, serial.SerialTimeoutException):
+        return False, []
+
+
 def ping_module(port):
     try:
-        with serial.Serial(port, 115200, timeout=SERIAL_TIMEOUT_S) as ser:
-            ser.reset_input_buffer()
-            frame = build_empty_read_frame()
-            ser.write(bytes(frame))
-
-            response_bytes = _read_response_frame(ser)
-            parsed = parse_response(response_bytes)
-            if not parsed:
-                return False
-            return parsed["kind"] in (RESPONSE_READY, RESPONSE_ACK_SHORT)
-
+        with open_connection(port) as ser:
+            return ping_on_connection(ser)
     except (serial.SerialException, serial.SerialTimeoutException):
         return False
 
 
 def send_frame(port, frame, operation):
     try:
-        with serial.Serial(port, 115200, timeout=SERIAL_TIMEOUT_S) as ser:
-            ser.reset_input_buffer()
-            ser.write(bytes(frame))
-
-            response_bytes = _read_response_frame(ser)
-            if not response_bytes:
-                return False, []
-
-            parsed = parse_response(response_bytes)
-            if not parsed:
-                return False, response_bytes
-
-            if parsed["kind"] == RESPONSE_NACK:
-                return False, response_bytes
-
-            expected_ack_kind = _expected_ack_kind(frame, operation)
-            if parsed["kind"] != expected_ack_kind:
-                return False, response_bytes
-
-            return True, response_bytes
-
+        with open_connection(port) as ser:
+            return send_frame_on_connection(ser, frame, operation)
     except (serial.SerialException, serial.SerialTimeoutException):
         return False, []
