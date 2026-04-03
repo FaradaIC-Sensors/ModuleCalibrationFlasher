@@ -13,17 +13,11 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "0.2"
+APP_VERSION = "0.3"
 APP_WINDOW_TITLE = f"FaradaIC Module Calibration Flasher v{APP_VERSION}"
 
 from module import Module
-from connection import (
-    ping_module,
-    send_frame,
-    open_connection,
-    ping_on_connection,
-    send_frame_on_connection,
-)
+from connection import send_frame
 from client import (
     build_registers_read_frame,
     build_registers_write_frame,
@@ -69,34 +63,20 @@ DISCOVER_PORT_TIMEOUT = 2  # seconds per port
 
 def _read_module_id_on_port(port: str):
     try:
-        with open_connection(port) as ser:
-            if not ping_on_connection(ser):
-                return None, "no frontend response"
-            data, error = _read_full_register_page(port, ser=ser)
-            if error is not None:
-                return None, f"register read failed - {error}"
-            tmp = Module()
-            if not tmp.deserialize(data):
-                return None, "register read failed - deserialization error"
-            return getattr(tmp, "module_id", None), None
+        data, error = _read_full_register_page(port)
+        if error is not None:
+            return None, f"register read failed - {error}"
+        tmp = Module()
+        if not tmp.deserialize(data):
+            return None, "register read failed - deserialization error"
+        return getattr(tmp, "module_id", None), None
     except Exception as exc:
         return None, f"unexpected error - {exc}"
 
 
 def _read_module_id_with_timeout(port: str):
-    return _read_module_id_with_timeout_result(port)
-    result = [(None, None)]
-
-    def _worker():
-        result[0] = _read_module_id_on_port(port)
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    t.join(timeout=DISCOVER_PORT_TIMEOUT)
-    if t.is_alive():
-        log(f"{port}: timed out after {DISCOVER_PORT_TIMEOUT}s — skipped")
-        return None
-    return result[0]
+    module_id, _error = _read_module_id_with_timeout_result(port)
+    return module_id
 
 
 def _read_module_id_with_timeout_result(port: str):
@@ -168,43 +148,35 @@ def action_upload_calibration_all():
             log(f"{port}: key {key} not found in JSON — skipped")
             continue
         try:
-            with open_connection(port) as ser:
-                tmp = Module()
-                tmp.module_id = mid
-                _apply_calibration_entry_to_module(tmp, entry)
-                tmp.calibration_timestamp = int(time.time()) & 0xFFFFFFFF
+            tmp = Module()
+            tmp.module_id = mid
+            _apply_calibration_entry_to_module(tmp, entry)
+            tmp.calibration_timestamp = int(time.time()) & 0xFFFFFFFF
+            addr, data = tmp.serialize_calibration_config()
+            status, resp = send_frame(
+                port, build_registers_write_frame(addr, data), OPERATION_WRITE
+            )
+            if not status:
+                code, name = _decode_nack(resp)
+                if name:
+                    log(f"{port}: write calibration config failed — NACK code={code} ({name})")
+                else:
+                    log(f"{port}: write calibration config failed — no response or unknown error (resp={resp})")
+                continue
 
-                if not ping_on_connection(ser):
-                    log(f"{port}: ping failed — skipped")
-                    continue
-                addr, data = tmp.serialize_calibration_config()
-                status, resp = send_frame_on_connection(
-                    ser, build_registers_write_frame(addr, data), OPERATION_WRITE
-                )
-                if not status:
-                    code, name = _decode_nack(resp)
-                    if name:
-                        log(f"{port}: write calibration config failed — NACK code={code} ({name})")
-                    else:
-                        log(f"{port}: write calibration config failed — no response or unknown error (resp={resp})")
-                    continue
-
-                if not ping_on_connection(ser):
-                    log(f"{port}: ping failed before flash store")
-                    continue
-                tmp.control_store_settings_to_flash()
-                c_addr, c_data = tmp.serialize_control()
-                status, resp = send_frame_on_connection(
-                    ser, build_registers_write_frame(c_addr, c_data), OPERATION_WRITE
-                )
-                if not status:
-                    code, name = _decode_nack(resp)
-                    if name:
-                        log(f"{port}: flash store failed — NACK code={code} ({name})")
-                    else:
-                        log(f"{port}: flash store failed — no response or unknown error (resp={resp})")
-                    continue
-                log(f"{port}: calibration uploaded for {key}")
+            tmp.control_store_settings_to_flash()
+            c_addr, c_data = tmp.serialize_control()
+            status, resp = send_frame(
+                port, build_registers_write_frame(c_addr, c_data), OPERATION_WRITE
+            )
+            if not status:
+                code, name = _decode_nack(resp)
+                if name:
+                    log(f"{port}: flash store failed — NACK code={code} ({name})")
+                else:
+                    log(f"{port}: flash store failed — no response or unknown error (resp={resp})")
+                continue
+            log(f"{port}: calibration uploaded for {key}")
         except Exception as e:
             log(f"{port}: error uploading calibration — {e}")
             continue
@@ -305,21 +277,16 @@ def _describe_response_failure(response_bytes):
     return "unexpected response"
 
 
-def _read_register_range(port: str, address: int, length: int, ser=None):
+def _read_register_range(port: str, address: int, length: int):
     data = []
     offset = 0
 
     while offset < length:
         chunk_len = min(length - offset, FRAME_MAX_PAYLOAD_SIZE)
         chunk_address = address + offset
-        if ser is not None:
-            status, frame = send_frame_on_connection(
-                ser, build_registers_read_frame(chunk_address, chunk_len), OPERATION_READ
-            )
-        else:
-            status, frame = send_frame(
-                port, build_registers_read_frame(chunk_address, chunk_len), OPERATION_READ
-            )
+        status, frame = send_frame(
+            port, build_registers_read_frame(chunk_address, chunk_len), OPERATION_READ
+        )
         if not status:
             return None, _describe_response_failure(frame)
 
@@ -337,8 +304,8 @@ def _read_register_range(port: str, address: int, length: int, ser=None):
     return data, None
 
 
-def _read_full_register_page(port: str, ser=None):
-    return _read_register_range(port, 0x0000, REGISTERS_PAGE_SIZE, ser=ser)
+def _read_full_register_page(port: str):
+    return _read_register_range(port, 0x0000, REGISTERS_PAGE_SIZE)
 
 
 # -------------- Logging -----------------
@@ -462,18 +429,9 @@ def _get_calibration_entry(data, module_id):
 # --------------- Device Actions ---------------
 
 
-def _read_module(port, ser=None):
+def _read_module(port):
     """Read full register page and return a deserialized Module, or None on failure."""
-    if ser is not None:
-        if not ping_on_connection(ser):
-            log(f"{port}: ping failed")
-            return None
-        data, error = _read_full_register_page(port, ser=ser)
-    else:
-        if not ping_module(port):
-            log(f"{port}: ping failed")
-            return None
-        data, error = _read_full_register_page(port)
+    data, error = _read_full_register_page(port)
     if error is not None:
         log(f"{port}: register read failed - {error}")
         return None
@@ -489,31 +447,24 @@ def action_run_sht40_measurement():
     if not port:
         log("No COM port selected")
         return
-    try:
-        with open_connection(port) as ser:
-            if not ping_on_connection(ser):
-                log("Ping failed (before SHT40 start)")
-                return
-            tmp = Module()
-            tmp.control_start_sht40_measurement_set()
-            addr, data = tmp.serialize_control()
-            status, _ = send_frame_on_connection(
-                ser, build_registers_write_frame(addr, data), OPERATION_WRITE
-            )
-            if not status:
-                log("Failed to send SHT40 start control")
-                return
-            log("SHT40 measurement started")
-            time.sleep(0.1)
-            result = _read_module(port, ser=ser)
-            if result:
-                log(f"  Status:      0x{result.status:02X}")
-                log(f"  Temperature: {result.temperature:.6f}")
-                log(f"  Humidity:    {result.humidity:.6f}")
-            else:
-                log("  Read back failed")
-    except serial.SerialException as e:
-        log(f"Serial error: {e}")
+    tmp = Module()
+    tmp.control_start_sht40_measurement_set()
+    addr, data = tmp.serialize_control()
+    status, _ = send_frame(
+        port, build_registers_write_frame(addr, data), OPERATION_WRITE
+    )
+    if not status:
+        log("Failed to send SHT40 start control")
+        return
+    log("SHT40 measurement started")
+    time.sleep(0.1)
+    result = _read_module(port)
+    if result:
+        log(f"  Status:      0x{result.status:02X}")
+        log(f"  Temperature: {result.temperature:.6f}")
+        log(f"  Humidity:    {result.humidity:.6f}")
+    else:
+        log("  Read back failed")
 
 
 def action_start_measurement():
@@ -521,32 +472,25 @@ def action_start_measurement():
     if not port:
         log("No COM port selected")
         return
-    try:
-        with open_connection(port) as ser:
-            if not ping_on_connection(ser):
-                log("Ping failed (before measurement start)")
-                return
-            tmp = Module()
-            tmp.control_start_measurement_set()
-            addr, data = tmp.serialize_control()
-            status, _ = send_frame_on_connection(
-                ser, build_registers_write_frame(addr, data), OPERATION_WRITE
-            )
-            if not status:
-                log("Failed to send measurement start control")
-                return
-            log("Measurement started")
-            time.sleep(0.25)
-            result = _read_module(port, ser=ser)
-            if result:
-                log(f"  Status:        0x{result.status:02X}")
-                log(f"  Concentration: {result.concentration:.6f}")
-                log(f"  Temperature:   {result.temperature:.6f}")
-                log(f"  Humidity:      {result.humidity:.6f}")
-            else:
-                log("  Read back failed")
-    except serial.SerialException as e:
-        log(f"Serial error: {e}")
+    tmp = Module()
+    tmp.control_start_measurement_set()
+    addr, data = tmp.serialize_control()
+    status, _ = send_frame(
+        port, build_registers_write_frame(addr, data), OPERATION_WRITE
+    )
+    if not status:
+        log("Failed to send measurement start control")
+        return
+    log("Measurement started")
+    time.sleep(0.25)
+    result = _read_module(port)
+    if result:
+        log(f"  Status:        0x{result.status:02X}")
+        log(f"  Concentration: {result.concentration:.6f}")
+        log(f"  Temperature:   {result.temperature:.6f}")
+        log(f"  Humidity:      {result.humidity:.6f}")
+    else:
+        log("  Read back failed")
 
 
 # --------------- Port Selection ---------------
