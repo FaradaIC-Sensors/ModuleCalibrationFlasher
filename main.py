@@ -19,10 +19,20 @@ APP_WINDOW_TITLE = f"FaradaIC Module Calibration Flasher v{APP_VERSION}"
 from module import Module
 from connection import ping_module, send_frame
 from client import (
-    build_registers_read_full_register_pageframe,
+    build_registers_read_frame,
     build_registers_write_frame,
 )
-from protocol import OPERATION_READ, OPERATION_WRITE, process_frame
+from protocol import (
+    FRAME_MAX_PAYLOAD_SIZE,
+    OPERATION_READ,
+    OPERATION_WRITE,
+    RESPONSE_ACK_LONG,
+    RESPONSE_ACK_SHORT,
+    RESPONSE_NACK,
+    RESPONSE_READY,
+    parse_response,
+)
+from registers import REGISTERS_PAGE_SIZE
 
 
 # ---------------- Utility -----------------
@@ -62,25 +72,21 @@ DISCOVER_PORT_TIMEOUT = 2  # seconds per port
 def _read_module_id_on_port(port: str):
     try:
         if not ping_device(port):
-            return None
-        status, frame = send_frame(
-            port, build_registers_read_full_register_pageframe(), OPERATION_READ
-        )
-        if not status:
-            return None
-        data = process_frame(frame)
-        if not data:
-            return None
+            return None, "no frontend response"
+        data, error = _read_full_register_page(port)
+        if error is not None:
+            return None, f"register read failed - {error}"
         tmp = Module()
         if not tmp.deserialize(data):
-            return None
-        return getattr(tmp, "module_id", None)
-    except Exception:
-        return None
+            return None, "register read failed - deserialization error"
+        return getattr(tmp, "module_id", None), None
+    except Exception as exc:
+        return None, f"unexpected error - {exc}"
 
 
 def _read_module_id_with_timeout(port: str):
-    result = [None]
+    return _read_module_id_with_timeout_result(port)
+    result = [(None, None)]
 
     def _worker():
         result[0] = _read_module_id_on_port(port)
@@ -94,6 +100,20 @@ def _read_module_id_with_timeout(port: str):
     return result[0]
 
 
+def _read_module_id_with_timeout_result(port: str):
+    result = [(None, None)]
+
+    def _worker():
+        result[0] = _read_module_id_on_port(port)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=DISCOVER_PORT_TIMEOUT)
+    if t.is_alive():
+        return None, f"timed out after {DISCOVER_PORT_TIMEOUT}s"
+    return result[0]
+
+
 def action_discover_devices():
     ports = discover_ports()
     if not ports:
@@ -102,12 +122,12 @@ def action_discover_devices():
     log(f"Starting discovery across {len(ports)} ports")
     found = []
     for p in ports:
-        module_id = _read_module_id_with_timeout(p)
+        module_id, error = _read_module_id_with_timeout_result(p)
         if module_id is not None:
             log(f"{p}: F{int(module_id)}")
             found.append({"port": p, "module_id": int(module_id)})
         else:
-            log(f"{p}: no frontend response")
+            log(f"{p}: {error or 'no frontend response'}")
     state["discovered_devices"] = found
     _update_discovered_list()
     log(f"Discovery complete — {len(found)} device(s) found")
@@ -211,8 +231,8 @@ state = {
 NACK_ERROR_MAP = {
     0: "PARSE_SUCCESS",
     1: "FRAME_ERROR_NULL_PTR",
-    2: "FRAME_ERROR_FIRST_NOT_STX",
-    3: "FRAME_ERROR_LAST_NOT_ETX",
+    2: "FRAME_ERROR_INVALID_LENGTH_PREFIX",
+    3: "FRAME_ERROR_FRAME_SIZE_MISMATCH",
     4: "FRAME_ERROR_LENGTH_MISMATCH",
     5: "FRAME_ERROR_INVALID_OPERATION",
     6: "FRAME_ERROR_INVALID_ADDRESS",
@@ -255,11 +275,66 @@ NACK_ERROR_MAP = {
 
 
 def _decode_nack(response_bytes):
-    if not response_bytes or len(response_bytes) < 3:
+    parsed = parse_response(response_bytes)
+    if not parsed or parsed["kind"] != RESPONSE_NACK:
         return None, None
-    code = response_bytes[2]
+    code = parsed["error_code"]
     name = NACK_ERROR_MAP.get(code)
     return code, name
+
+
+def _describe_response_failure(response_bytes):
+    if not response_bytes:
+        return "no response"
+
+    parsed = parse_response(response_bytes)
+    if not parsed:
+        return "invalid frame"
+
+    if parsed["kind"] == RESPONSE_NACK:
+        code, name = _decode_nack(response_bytes)
+        if name:
+            return f"NACK code={code} ({name})"
+        return f"NACK code={code}"
+
+    if parsed["kind"] == RESPONSE_READY:
+        return "unexpected READY response"
+
+    if parsed["kind"] == RESPONSE_ACK_SHORT:
+        return "unexpected short ACK"
+
+    return "unexpected response"
+
+
+def _read_register_range(port: str, address: int, length: int):
+    data = []
+    offset = 0
+
+    while offset < length:
+        chunk_len = min(length - offset, FRAME_MAX_PAYLOAD_SIZE)
+        chunk_address = address + offset
+        status, frame = send_frame(
+            port, build_registers_read_frame(chunk_address, chunk_len), OPERATION_READ
+        )
+        if not status:
+            return None, _describe_response_failure(frame)
+
+        parsed = parse_response(frame)
+        if not parsed or parsed["kind"] != RESPONSE_ACK_LONG:
+            return None, "invalid frame"
+        if parsed["address"] != chunk_address or parsed["length"] != chunk_len:
+            return None, "invalid frame"
+        if len(parsed["payload"]) != chunk_len:
+            return None, "invalid frame"
+
+        data.extend(parsed["payload"])
+        offset += chunk_len
+
+    return data, None
+
+
+def _read_full_register_page(port: str):
+    return _read_register_range(port, 0x0000, REGISTERS_PAGE_SIZE)
 
 
 # -------------- Logging -----------------
@@ -388,19 +463,13 @@ def _read_module(port):
     if not ping_device(port):
         log(f"{port}: ping failed")
         return None
-    status, frame = send_frame(
-        port, build_registers_read_full_register_pageframe(), OPERATION_READ
-    )
-    if not status:
-        log(f"{port}: register read failed — no response")
-        return None
-    data = process_frame(frame)
-    if not data:
-        log(f"{port}: register read failed — invalid frame")
+    data, error = _read_full_register_page(port)
+    if error is not None:
+        log(f"{port}: register read failed - {error}")
         return None
     tmp = Module()
     if not tmp.deserialize(data):
-        log(f"{port}: register read failed — deserialization error")
+        log(f"{port}: register read failed - deserialization error")
         return None
     return tmp
 
