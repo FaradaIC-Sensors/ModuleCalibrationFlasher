@@ -213,3 +213,6 @@ coeff/*
 scripts/*
 scripts_FM25L4J1/*
 /nul
+
+CLAUDE.md
+deploy.bat

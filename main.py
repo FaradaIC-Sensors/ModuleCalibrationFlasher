@@ -17,7 +17,7 @@ APP_VERSION = "0.2"
 APP_WINDOW_TITLE = f"FaradaIC Module Calibration Flasher v{APP_VERSION}"
 
 from module import Module
-from connection import ping_module, send_frame
+from connection import send_frame
 from client import (
     build_registers_read_full_register_pageframe,
     build_registers_write_frame,
@@ -48,21 +48,11 @@ def discover_ports():
     return ports
 
 
-def ping_device(port: str) -> bool:
-    if not port:
-        return False
-    status = ping_module(port)
-    time.sleep(0.01)
-    return bool(status)
-
-
 DISCOVER_PORT_TIMEOUT = 2  # seconds per port
 
 
 def _read_module_id_on_port(port: str):
     try:
-        if not ping_device(port):
-            return None
         status, frame = send_frame(
             port, build_registers_read_full_register_pageframe(), OPERATION_READ
         )
@@ -154,10 +144,6 @@ def action_upload_calibration_all():
             _apply_calibration_entry_to_module(tmp, entry)
             tmp.calibration_timestamp = int(time.time()) & 0xFFFFFFFF
 
-            if not ping_device(port):
-                log(f"{port}: ping failed — skipped")
-                continue
-            time.sleep(0.03)
             addr, data = tmp.serialize_calibration_config()
             status, resp = send_frame(
                 port, build_registers_write_frame(addr, data), OPERATION_WRITE
@@ -169,10 +155,7 @@ def action_upload_calibration_all():
                 else:
                     log(f"{port}: write calibration config failed — no response or unknown error (resp={resp})")
                 continue
-            if not ping_device(port):
-                log(f"{port}: ping failed before flash store")
-                continue
-            time.sleep(0.05)
+
             tmp.control_store_settings_to_flash()
             c_addr, c_data = tmp.serialize_control()
             status, resp = send_frame(
@@ -385,9 +368,6 @@ def _get_calibration_entry(data, module_id):
 
 def _read_module(port):
     """Read full register page and return a deserialized Module, or None on failure."""
-    if not ping_device(port):
-        log(f"{port}: ping failed")
-        return None
     status, frame = send_frame(
         port, build_registers_read_full_register_pageframe(), OPERATION_READ
     )
@@ -409,9 +389,6 @@ def action_run_sht40_measurement():
     port = state["selected_port"]
     if not port:
         log("No COM port selected")
-        return
-    if not ping_device(port):
-        log("Ping failed (before SHT40 start)")
         return
     tmp = Module()
     tmp.control_start_sht40_measurement_set()
@@ -437,9 +414,6 @@ def action_start_measurement():
     port = state["selected_port"]
     if not port:
         log("No COM port selected")
-        return
-    if not ping_device(port):
-        log("Ping failed (before measurement start)")
         return
     tmp = Module()
     tmp.control_start_measurement_set()
