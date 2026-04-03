@@ -13,7 +13,7 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "0.2"
+APP_VERSION = "0.3"
 APP_WINDOW_TITLE = f"FaradaIC Module Calibration Flasher v{APP_VERSION}"
 
 from module import Module
