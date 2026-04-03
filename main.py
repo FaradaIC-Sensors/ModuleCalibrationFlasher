@@ -13,7 +13,7 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "0.3"
+APP_VERSION = "0.4"
 APP_WINDOW_TITLE = f"FaradaIC Module Calibration Flasher v{APP_VERSION}"
 
 from module import Module
@@ -432,6 +432,7 @@ def action_start_measurement():
         log(f"  Concentration: {result.concentration:.6f}")
         log(f"  Temperature:   {result.temperature:.6f}")
         log(f"  Humidity:      {result.humidity:.6f}")
+        log(f"  Current:       {result.current:.6f}")
     else:
         log("  Read back failed")
 
