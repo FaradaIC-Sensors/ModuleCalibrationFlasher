@@ -385,6 +385,20 @@ def _read_module(port):
     return tmp
 
 
+def action_read_info():
+    port = state["selected_port"]
+    if not port:
+        log("No COM port selected")
+        return
+    result = _read_module(port)
+    if not result:
+        log("Read info failed")
+        return
+    log(f"ModuleId: {result.module_id}")
+    log(f"Firmware Version: {result.firmware_ver_major}.{result.firmware_ver_minor}")
+    log(f"Register Map Version: {result.register_map_ver_major}.{result.register_map_ver_minor}")
+
+
 def action_run_sht40_measurement():
     port = state["selected_port"]
     if not port:
@@ -513,6 +527,9 @@ def _build_device_col(parent):
 
     ttk.Separator(col, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=4, pady=4)
 
+    ttk.Button(col, text="Read Info", command=action_read_info).pack(
+        fill=tk.X, padx=4, pady=(0, 2)
+    )
     ttk.Button(col, text="Run O2 Conc", command=action_start_measurement).pack(
         fill=tk.X, padx=4, pady=(0, 2)
     )
