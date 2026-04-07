@@ -4,6 +4,7 @@ import ctypes
 import threading
 import os
 import sys
+import subprocess
 import tkinter as tk
 from tkinter import ttk, filedialog
 import serial.tools.list_ports
@@ -399,6 +400,56 @@ def action_read_info():
     log(f"Register Map Version: {result.register_map_ver_major}.{result.register_map_ver_minor}")
 
 
+def _flash_firmware(firmware_filename):
+    port = state["selected_port"]
+    if not port:
+        log("No COM port selected")
+        return
+    cwd = os.getcwd()
+    programmer = os.path.join(cwd, "STM32CubeProgrammer", "bin", "STM32_PROGRAMMER_CLI.exe")
+    firmware = os.path.join(cwd, "firmware", firmware_filename)
+    if not os.path.isfile(programmer):
+        log(f"STM32CubeProgrammer not found: {programmer}")
+        return
+    if not os.path.isfile(firmware):
+        log(f"Firmware file not found: {firmware}")
+        return
+    flash_cmd = [programmer, "-c", f"port={port}", "br=115200", "-d", firmware, "-v", "-s"]
+    log(f"[{port}] {' '.join(flash_cmd)}")
+    log(f"[{port}] Firmware flashing started")
+
+    def _worker():
+        try:
+            proc = subprocess.Popen(
+                flash_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            for line in proc.stdout:
+                log(line.rstrip())
+            proc.wait()
+            if proc.returncode != 0:
+                log(f"[{port}] Flashing failed (exit code {proc.returncode})")
+            else:
+                log(f"[{port}] Firmware flashing completed successfully")
+        except FileNotFoundError:
+            log(f"[{port}] STM32CubeProgrammer CLI not found")
+        except Exception as e:
+            log(f"[{port}] Flashing error: {e}")
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def action_flash_blulog_fw():
+    _flash_firmware("Blulog_STM32L432_FEModule_v1.11_FM25L4J1.hex")
+
+
+def action_flash_faradaic_fw():
+    _flash_firmware("STM32L432_FEModule_v1.11_FM25L4J1.hex")
+
+
 def action_run_sht40_measurement():
     port = state["selected_port"]
     if not port:
@@ -534,6 +585,14 @@ def _build_device_col(parent):
         fill=tk.X, padx=4, pady=(0, 2)
     )
     ttk.Button(col, text="Run SHT40", command=action_run_sht40_measurement).pack(
+        fill=tk.X, padx=4, pady=(0, 2)
+    )
+
+    ttk.Separator(col, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=4, pady=4)
+    ttk.Button(col, text="Flash Blulog FW", command=action_flash_blulog_fw).pack(
+        fill=tk.X, padx=4, pady=(0, 2)
+    )
+    ttk.Button(col, text="Flash FaradaIC FW", command=action_flash_faradaic_fw).pack(
         fill=tk.X, padx=4, pady=(0, 2)
     )
 
