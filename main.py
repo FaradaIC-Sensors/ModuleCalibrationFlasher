@@ -628,7 +628,7 @@ def _build_fleet_col(parent):
         side=tk.LEFT
     )
 
-    ttk.Label(col, text="Module Operations", font=SECTION_HEADER_FONT).pack(
+    ttk.Label(col, text="Calibration Operations", font=SECTION_HEADER_FONT).pack(
         padx=4, pady=(4, 4), anchor=tk.W
     )
 
