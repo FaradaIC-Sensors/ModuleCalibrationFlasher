@@ -14,16 +14,24 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "0.4"
+APP_VERSION = "0.5"
 APP_WINDOW_TITLE = f"FaradaIC Module Calibration Flasher v{APP_VERSION}"
+SECTION_HEADER_FONT = ("TkDefaultFont", 10, "bold")
 
 from module import Module
 from connection import send_frame
 from client import (
-    build_registers_read_full_register_pageframe,
+    build_registers_read_frame,
     build_registers_write_frame,
 )
-from protocol import OPERATION_READ, OPERATION_WRITE, process_frame
+from protocol import (
+    BLULOG_MAX_PAYLOAD_SIZE,
+    OPERATION_READ,
+    OPERATION_WRITE,
+    blulog_process_frame,
+    process_frame,
+)
+from registers import REGISTERS_PAGE_SIZE
 
 
 # ---------------- Utility -----------------
@@ -52,15 +60,10 @@ def discover_ports():
 DISCOVER_PORT_TIMEOUT = 2  # seconds per port
 
 
-def _read_module_id_on_port(port: str):
+def _read_module_id_on_port(port: str, protocol: str = "faradaic"):
     try:
-        status, frame = send_frame(
-            port, build_registers_read_full_register_pageframe(), OPERATION_READ
-        )
-        if not status:
-            return None
-        data = process_frame(frame)
-        if not data:
+        data, error = _read_register_page(port, protocol)
+        if error or not data:
             return None
         tmp = Module()
         if not tmp.deserialize(data):
@@ -70,11 +73,11 @@ def _read_module_id_on_port(port: str):
         return None
 
 
-def _read_module_id_with_timeout(port: str):
+def _read_module_id_with_timeout(port: str, protocol: str = "faradaic"):
     result = [None]
 
     def _worker():
-        result[0] = _read_module_id_on_port(port)
+        result[0] = _read_module_id_on_port(port, protocol)
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()
@@ -90,10 +93,11 @@ def action_discover_devices():
     if not ports:
         log("No COM ports available for discovery")
         return
+    protocol = _get_protocol()
     log(f"Starting discovery across {len(ports)} ports")
     found = []
     for p in ports:
-        module_id = _read_module_id_with_timeout(p)
+        module_id = _read_module_id_with_timeout(p, protocol)
         if module_id is not None:
             log(f"{p}: F{int(module_id)}")
             found.append({"port": p, "module_id": int(module_id)})
@@ -139,6 +143,7 @@ def action_upload_calibration_all():
         if not entry:
             log(f"{port}: key {key} not found in JSON — skipped")
             continue
+        protocol = _get_protocol()
         try:
             tmp = Module()
             tmp.module_id = mid
@@ -147,10 +152,10 @@ def action_upload_calibration_all():
 
             addr, data = tmp.serialize_calibration_config()
             status, resp = send_frame(
-                port, build_registers_write_frame(addr, data), OPERATION_WRITE
+                port, build_registers_write_frame(addr, data, protocol), OPERATION_WRITE, protocol
             )
             if not status:
-                code, name = _decode_nack(resp)
+                code, name = _decode_nack(resp, protocol)
                 if name:
                     log(f"{port}: write calibration config failed — NACK code={code} ({name})")
                 else:
@@ -160,10 +165,10 @@ def action_upload_calibration_all():
             tmp.control_store_settings_to_flash()
             c_addr, c_data = tmp.serialize_control()
             status, resp = send_frame(
-                port, build_registers_write_frame(c_addr, c_data), OPERATION_WRITE
+                port, build_registers_write_frame(c_addr, c_data, protocol), OPERATION_WRITE, protocol
             )
             if not status:
-                code, name = _decode_nack(resp)
+                code, name = _decode_nack(resp, protocol)
                 if name:
                     log(f"{port}: flash store failed — NACK code={code} ({name})")
                 else:
@@ -190,9 +195,15 @@ state = {
     "port_combo": None,
     "discovered_devices": [],
     "device_listbox": None,
+    "protocol_var": None,
 }
 
-NACK_ERROR_MAP = {
+def _get_protocol():
+    var = state.get("protocol_var")
+    return var.get() if var else "faradaic"
+
+
+FARADAIC_NACK_ERROR_MAP = {
     0: "PARSE_SUCCESS",
     1: "FRAME_ERROR_NULL_PTR",
     2: "FRAME_ERROR_FIRST_NOT_STX",
@@ -238,11 +249,22 @@ NACK_ERROR_MAP = {
 }
 
 
-def _decode_nack(response_bytes):
+BLULOG_NACK_ERROR_MAP = dict(FARADAIC_NACK_ERROR_MAP)
+BLULOG_NACK_ERROR_MAP.update(
+    {
+        2: "FRAME_ERROR_INVALID_LENGTH_PREFIX",
+        3: "FRAME_ERROR_FRAME_SIZE_MISMATCH",
+        8: "FRAME_ERROR_CRC_MISMATCH",
+    }
+)
+
+
+def _decode_nack(response_bytes, protocol="faradaic"):
     if not response_bytes or len(response_bytes) < 3:
         return None, None
     code = response_bytes[2]
-    name = NACK_ERROR_MAP.get(code)
+    error_map = BLULOG_NACK_ERROR_MAP if protocol == "blulog" else FARADAIC_NACK_ERROR_MAP
+    name = error_map.get(code)
     return code, name
 
 
@@ -364,18 +386,59 @@ def _get_calibration_entry(data, module_id):
     return data.get(key) or data.get(f"{key}-0")
 
 
+def _read_registers(port, address, length, protocol):
+    _process = blulog_process_frame if protocol == "blulog" else process_frame
+    try:
+        request = build_registers_read_frame(address, length, protocol)
+    except ValueError as e:
+        return None, str(e)
+
+    status, response = send_frame(port, request, OPERATION_READ, protocol)
+    if not status:
+        code, name = _decode_nack(response, protocol)
+        if name:
+            return None, f"{port}: register read failed - NACK code={code} ({name})"
+        if response:
+            return None, f"{port}: register read failed - invalid response ({response})"
+        return None, f"{port}: register read failed - no response"
+
+    data = _process(response)
+    if data is None:
+        return None, f"{port}: register read failed - invalid frame"
+    if len(data) != length:
+        return None, f"{port}: register read failed - expected {length} bytes, got {len(data)}"
+    return data, None
+
+
+def _read_register_page(port, protocol):
+    if protocol != "blulog":
+        return _read_registers(port, 0x0000, REGISTERS_PAGE_SIZE, protocol)
+
+    page = []
+    offset = 0
+    while offset < REGISTERS_PAGE_SIZE:
+        chunk_len = min(REGISTERS_PAGE_SIZE - offset, BLULOG_MAX_PAYLOAD_SIZE)
+        chunk, error = _read_registers(port, offset, chunk_len, protocol)
+        if error:
+            return None, error
+        page.extend(chunk)
+        offset += chunk_len
+    return page, None
+
+
 # --------------- Device Actions ---------------
 
 
-def _read_module(port):
+def _read_module_broken(port, protocol=None):
+    return _read_module(port, protocol)
     """Read full register page and return a deserialized Module, or None on failure."""
-    status, frame = send_frame(
-        port, build_registers_read_full_register_pageframe(), OPERATION_READ
-    )
+    if protocol is None:
+        protocol = _get_protocol()
+    data, error = _read_register_page(port, protocol)
     if not status:
         log(f"{port}: register read failed — no response")
         return None
-    data = process_frame(frame)
+    data = _process(frame)
     if not data:
         log(f"{port}: register read failed — invalid frame")
         return None
@@ -386,12 +449,30 @@ def _read_module(port):
     return tmp
 
 
+def _read_module(port, protocol=None):
+    """Read full register page and return a deserialized Module, or None on failure."""
+    if protocol is None:
+        protocol = _get_protocol()
+    data, error = _read_register_page(port, protocol)
+    if error:
+        log(error)
+        return None
+    if not data:
+        log(f"{port}: register read failed - empty payload")
+        return None
+    tmp = Module()
+    if not tmp.deserialize(data):
+        log(f"{port}: register read failed - deserialization error")
+        return None
+    return tmp
+
+
 def action_read_info():
     port = state["selected_port"]
     if not port:
         log("No COM port selected")
         return
-    result = _read_module(port)
+    result = _read_module(port, _get_protocol())
     if not result:
         log("Read info failed")
         return
@@ -455,18 +536,19 @@ def action_run_sht40_measurement():
     if not port:
         log("No COM port selected")
         return
+    protocol = _get_protocol()
     tmp = Module()
     tmp.control_start_sht40_measurement_set()
     addr, data = tmp.serialize_control()
     status, _ = send_frame(
-        port, build_registers_write_frame(addr, data), OPERATION_WRITE
+        port, build_registers_write_frame(addr, data, protocol), OPERATION_WRITE, protocol
     )
     if not status:
         log("Failed to send SHT40 start control")
         return
     log("SHT40 measurement started")
     time.sleep(0.1)
-    result = _read_module(port)
+    result = _read_module(port, protocol)
     if result:
         log(f"  Status:      0x{result.status:02X}")
         log(f"  Temperature: {result.temperature:.6f}")
@@ -480,18 +562,19 @@ def action_start_measurement():
     if not port:
         log("No COM port selected")
         return
+    protocol = _get_protocol()
     tmp = Module()
     tmp.control_start_measurement_set()
     addr, data = tmp.serialize_control()
     status, _ = send_frame(
-        port, build_registers_write_frame(addr, data), OPERATION_WRITE
+        port, build_registers_write_frame(addr, data, protocol), OPERATION_WRITE, protocol
     )
     if not status:
         log("Failed to send measurement start control")
         return
     log("Measurement started")
     time.sleep(0.25)
-    result = _read_module(port)
+    result = _read_module(port, protocol)
     if result:
         log(f"  Status:        0x{result.status:02X}")
         log(f"  Concentration: {result.concentration:.6f}")
@@ -531,7 +614,21 @@ def select_port_callback(event=None):
 def _build_fleet_col(parent):
     col = ttk.Frame(parent)
 
-    ttk.Label(col, text="Module Operations", font=("TkDefaultFont", 10, "bold")).pack(
+    ttk.Label(col, text="Protocol", font=SECTION_HEADER_FONT).pack(
+        padx=4, pady=(4, 4), anchor=tk.W
+    )
+    protocol_var = tk.StringVar(value="faradaic")
+    state["protocol_var"] = protocol_var
+    radio_frame = ttk.Frame(col)
+    radio_frame.pack(fill=tk.X, padx=4, pady=(0, 4))
+    ttk.Radiobutton(radio_frame, text="FaradaIC", variable=protocol_var, value="faradaic").pack(
+        side=tk.LEFT, padx=(0, 8)
+    )
+    ttk.Radiobutton(radio_frame, text="Blulog", variable=protocol_var, value="blulog").pack(
+        side=tk.LEFT
+    )
+
+    ttk.Label(col, text="Module Operations", font=SECTION_HEADER_FONT).pack(
         padx=4, pady=(4, 4), anchor=tk.W
     )
 
@@ -556,7 +653,7 @@ def _build_fleet_col(parent):
 def _build_device_col(parent):
     col = ttk.Frame(parent)
 
-    ttk.Label(col, text="Device", font=("TkDefaultFont", 10, "bold")).pack(
+    ttk.Label(col, text="Device", font=SECTION_HEADER_FONT).pack(
         padx=4, pady=(4, 4), anchor=tk.W
     )
 
@@ -576,8 +673,6 @@ def _build_device_col(parent):
         fill=tk.X, padx=4, pady=(0, 4)
     )
 
-    ttk.Separator(col, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=4, pady=4)
-
     ttk.Button(col, text="Read Info", command=action_read_info).pack(
         fill=tk.X, padx=4, pady=(0, 2)
     )
@@ -589,6 +684,9 @@ def _build_device_col(parent):
     )
 
     ttk.Separator(col, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=4, pady=4)
+    ttk.Label(col, text="Firmware", font=SECTION_HEADER_FONT).pack(
+        padx=4, pady=(0, 4), anchor=tk.W
+    )
     ttk.Button(col, text="Flash Blulog FW", command=action_flash_blulog_fw).pack(
         fill=tk.X, padx=4, pady=(0, 2)
     )

@@ -80,6 +80,61 @@ def build_frame(operation, address, data, data_len):
     return frame
 
 
+BLULOG_FRAME_PROTOCOL_OVERHEAD = 8  # LENGTH + OP + ADDR(2) + LEN(2) + CRC(2)
+BLULOG_READY_LENGTH = 4   # LENGTH + READY + CRC(2)
+BLULOG_ACK_LENGTH = 4     # LENGTH + ACK + CRC(2)
+BLULOG_NACK_LENGTH = 5    # LENGTH + NACK + error_code + CRC(2)
+BLULOG_MAX_PAYLOAD_SIZE = 248  # One-byte length prefix limits total bytes after it to 255.
+
+
+def blulog_build_frame(operation, address, data, data_len):
+    # Build packet: [OP, ADDR_LSB, ADDR_MSB, LEN_LSB, LEN_MSB, DATA...]
+    packet = bytearray([
+        operation,
+        address & 0xFF,
+        (address >> 8) & 0xFF,
+        data_len & 0xFF,
+        (data_len >> 8) & 0xFF,
+    ])
+    if operation == OPERATION_WRITE and data_len > 0:
+        packet.extend(data)
+    # Prepend LENGTH byte = len(packet) + 2 (for the 2 CRC bytes)
+    frame = bytearray([len(packet) + 2])
+    frame.extend(packet)
+    # CRC covers LENGTH + packet (everything before CRC)
+    crc16 = _crc16_ccitt_false(frame)
+    frame.append(crc16 & 0xFF)
+    frame.append((crc16 >> 8) & 0xFF)
+    return list(frame)
+
+
+def blulog_process_frame(frame):
+    if not frame or len(frame) < BLULOG_READY_LENGTH:
+        return None
+    # Length field: frame[0] = bytes after it; total frame = frame[0] + 1
+    if frame[0] + 1 != len(frame):
+        return None
+    # Validate CRC (covers everything before the last 2 bytes)
+    crc_received = frame[-2] | (frame[-1] << 8)
+    crc_calc = _crc16_ccitt_false(frame[:-2])
+    if crc_calc != crc_received:
+        return None
+    # Op code is at position 1 (same as FaradaIC but shifted by 1 due to LENGTH byte replacing STX)
+    op_code = frame[FRAME_OP_POS]
+    if op_code != ACK:
+        return None
+    if len(frame) < BLULOG_FRAME_PROTOCOL_OVERHEAD:
+        # Short ACK (no data)
+        return []
+    data_len = frame[FRAME_LEN_LSB_POS] | (frame[FRAME_LEN_MSB_POS] << 8)
+    if data_len == 0:
+        return []
+    expected_len = BLULOG_FRAME_PROTOCOL_OVERHEAD + data_len
+    if len(frame) != expected_len:
+        return None
+    return list(frame[FRAME_DATA_POS:FRAME_DATA_POS + data_len])
+
+
 def process_frame(frame):
     # Basic structure checks
     if not frame or frame[0] != STX or frame[-1] != ETX:
