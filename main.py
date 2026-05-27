@@ -37,6 +37,37 @@ from registers import REGISTERS_PAGE_SIZE
 # ---------------- Utility -----------------
 
 
+def configure_process_dpi_awareness():
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except (AttributeError, OSError):
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except (AttributeError, OSError):
+            pass
+
+
+def set_window_icon(root):
+    ico_path = os.path.join(APP_DIR, "assets", "app.ico")
+    if sys.platform == "win32" and os.path.isfile(ico_path):
+        try:
+            root.iconbitmap(ico_path)
+            return
+        except tk.TclError:
+            pass
+
+    png_path = os.path.join(APP_DIR, "assets", "app.png")
+    if os.path.isfile(png_path):
+        try:
+            icon = tk.PhotoImage(file=png_path)
+            root.iconphoto(True, icon)
+            root._app_icon = icon
+        except tk.TclError:
+            pass
+
+
 def discover_ports():
     ports = []
     for p in serial.tools.list_ports.comports():
@@ -91,7 +122,7 @@ def _read_module_id_with_timeout(port: str, protocol: str = "faradaic"):
 def action_discover_devices():
     ports = discover_ports()
     if not ports:
-        log("No COM ports available for discovery")
+        log("No serial ports available for discovery")
         return
     protocol = _get_protocol()
     log(f"Starting discovery across {len(ports)} ports")
@@ -470,7 +501,7 @@ def _read_module(port, protocol=None):
 def action_read_info():
     port = state["selected_port"]
     if not port:
-        log("No COM port selected")
+        log("No serial port selected")
         return
     result = _read_module(port, _get_protocol())
     if not result:
@@ -484,7 +515,7 @@ def action_read_info():
 def _flash_firmware(firmware_filename):
     port = state["selected_port"]
     if not port:
-        log("No COM port selected")
+        log("No serial port selected")
         return
     cwd = os.getcwd()
     programmer = os.path.join(cwd, "STM32CubeProgrammer", "bin", "STM32_PROGRAMMER_CLI.exe")
@@ -534,7 +565,7 @@ def action_flash_faradaic_fw():
 def action_run_sht40_measurement():
     port = state["selected_port"]
     if not port:
-        log("No COM port selected")
+        log("No serial port selected")
         return
     protocol = _get_protocol()
     tmp = Module()
@@ -560,7 +591,7 @@ def action_run_sht40_measurement():
 def action_start_measurement():
     port = state["selected_port"]
     if not port:
-        log("No COM port selected")
+        log("No serial port selected")
         return
     protocol = _get_protocol()
     tmp = Module()
@@ -659,7 +690,7 @@ def _build_device_col(parent):
 
     port_frame = ttk.Frame(col)
     port_frame.pack(fill=tk.X, padx=4, pady=(0, 4))
-    ttk.Label(port_frame, text="COM Port").pack(side=tk.LEFT, padx=(0, 4))
+    ttk.Label(port_frame, text="Serial Port").pack(side=tk.LEFT, padx=(0, 4))
     port_var = tk.StringVar()
     combo = ttk.Combobox(
         port_frame, textvariable=port_var, values=discover_ports(), width=12
@@ -736,9 +767,7 @@ def create_gui():
     root = tk.Tk()
     root.title(APP_WINDOW_TITLE)
     root.geometry("800x600")
-    ico_path = os.path.join(APP_DIR, "assets", "app.ico")
-    if os.path.isfile(ico_path):
-        root.iconbitmap(ico_path)
+    set_window_icon(root)
     state["root"] = root
 
     root.grid_columnconfigure(0, weight=1)
@@ -768,7 +797,7 @@ def create_gui():
 
 
 def run():
-    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    configure_process_dpi_awareness()
     root = create_gui()
     root.mainloop()
 
