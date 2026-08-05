@@ -1,6 +1,7 @@
 import time
 import json
 import ctypes
+import glob
 import threading
 import os
 import sys
@@ -70,19 +71,29 @@ def set_window_icon(root):
 
 def discover_ports():
     ports = []
-    for p in serial.tools.list_ports.comports():
-        name = p.device
+
+    def add_port(name):
+        if not name:
+            return
         if name.upper() == "COM1":
-            continue
-        ports.append(name)
+            return
+        if name not in ports:
+            ports.append(name)
+
+    for p in serial.tools.list_ports.comports():
+        add_port(p.device)
+
+    if os.name != "nt":
+        for name in glob.glob("/dev/ttyCH*"):
+            add_port(name)
 
     def sort_key(v):
         try:
             if v.upper().startswith("COM"):
-                return int(v[3:])
+                return (0, int(v[3:]))
         except ValueError:
             pass
-        return 9999
+        return (1, v.lower())
 
     ports.sort(key=sort_key)
     return ports
@@ -604,7 +615,7 @@ def action_start_measurement():
         log("Failed to send measurement start control")
         return
     log("Measurement started")
-    time.sleep(0.25)
+    time.sleep(0.3)
     result = _read_module(port, protocol)
     if result:
         log(f"  Status:        0x{result.status:02X}")
@@ -693,7 +704,7 @@ def _build_device_col(parent):
     ttk.Label(port_frame, text="Serial Port").pack(side=tk.LEFT, padx=(0, 4))
     port_var = tk.StringVar()
     combo = ttk.Combobox(
-        port_frame, textvariable=port_var, values=discover_ports(), width=12
+        port_frame, textvariable=port_var, values=discover_ports(), width=22
     )
     combo.pack(side=tk.LEFT)
     combo.bind("<<ComboboxSelected>>", select_port_callback)
