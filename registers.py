@@ -81,7 +81,8 @@ class Registers(IntEnum):
     REG_COULOMB_COUNTER_LMSB = 0x47
     REG_COULOMB_COUNTER_MLSB = 0x48
     REG_COULOMB_COUNTER_MMSB = 0x49
-    REG_RESERVED23 = 0x4A
+    # Firmware config (bit 0: wire protocol, 0 = main, 1 = blulog). Reserved before v1.17.
+    REG_CONFIG_FIRMWARE = 0x4A
     REG_RESERVED24 = 0x4B
     REG_RESERVED25 = 0x4C
     REG_RESERVED26 = 0x4D

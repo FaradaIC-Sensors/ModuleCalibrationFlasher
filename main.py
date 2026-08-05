@@ -33,6 +33,7 @@ from protocol import (
     process_frame,
 )
 from registers import REGISTERS_PAGE_SIZE
+import settings_backup
 
 
 # ---------------- Utility -----------------
@@ -468,6 +469,57 @@ def _read_register_page(port, protocol):
     return page, None
 
 
+def _write_registers(port, address, data, protocol, what):
+    """Write one register block, logging the decoded NACK on failure."""
+    try:
+        request = build_registers_write_frame(address, data, protocol)
+    except ValueError as e:
+        log(f"{port}: {what} write failed - {e}")
+        return False
+
+    status, response = send_frame(port, request, OPERATION_WRITE, protocol)
+    if status:
+        return True
+    code, name = _decode_nack(response, protocol)
+    if name:
+        log(f"{port}: {what} write failed - NACK code={code} ({name})")
+    elif response:
+        log(f"{port}: {what} write failed - unexpected response ({response})")
+    else:
+        log(f"{port}: {what} write failed - no response")
+    return False
+
+
+def _read_script_with_plan(port, protocol, plan):
+    script = []
+    for address, length in plan:
+        chunk, error = _read_registers(port, address, length, protocol)
+        if error:
+            return None, error
+        script.extend(chunk)
+    return script, None
+
+
+def _read_script(port, protocol):
+    """Read the measurement script buffer as far as the protocol can address it.
+
+    A full-buffer read sits right on the firmware's payload bound check, so fall
+    back to page-sized reads if the module rejects it.
+    """
+    script, error = _read_script_with_plan(
+        port, protocol, settings_backup.script_read_plan(protocol)
+    )
+    if not error:
+        return script, None
+
+    log(f"{port}: full script read rejected, retrying page by page - {error}")
+    return _read_script_with_plan(
+        port,
+        protocol,
+        settings_backup.script_read_plan(protocol, settings_backup.SCRIPT_SAFE_CHUNK_SIZE),
+    )
+
+
 # --------------- Device Actions ---------------
 
 
@@ -521,6 +573,160 @@ def action_read_info():
     log(f"ModuleId: {result.module_id}")
     log(f"Firmware Version: {result.firmware_ver_major}.{result.firmware_ver_minor}")
     log(f"Register Map Version: {result.register_map_ver_major}.{result.register_map_ver_minor}")
+
+
+def action_get_module_settings_v11():
+    """Back up settings and measurement script of a module still running v1.11."""
+    port = state["selected_port"]
+    if not port:
+        log("No serial port selected")
+        return
+    protocol = _get_protocol()
+
+    page, error = _read_register_page(port, protocol)
+    if error:
+        log(error)
+        return
+
+    script, error = _read_script(port, protocol)
+    if error:
+        log(f"{port}: script read failed, backing up settings only - {error}")
+        script = []
+
+    try:
+        backup = settings_backup.build_backup(page, script, port, protocol)
+    except ValueError as e:
+        log(f"{port}: backup failed - {e}")
+        return
+
+    source = backup["source"]
+    firmware_version = source["firmware_version"]
+    if firmware_version != "1.11":
+        log(f"{port}: warning - module reports firmware {firmware_version}, expected 1.11")
+
+    module_id = source["module_id"]
+    script_text = backup["script"]
+    log(
+        f"{port}: F{module_id} firmware {firmware_version}, "
+        f"register map {source['register_map_version']}"
+    )
+    log(f"{port}: script {len(script_text)} bytes, {len(script_text.splitlines())} line(s)")
+    for removed in backup["script_removed_lines"]:
+        log(f"{port}: dropped script line not supported by v1.17: {removed}")
+    if not script_text:
+        log(f"{port}: warning - module returned an empty script")
+
+    file_path = filedialog.asksaveasfilename(
+        title="Save Module Settings (v1.11)",
+        defaultextension=".json",
+        initialfile=settings_backup.default_backup_filename(module_id, firmware_version),
+        filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+    )
+    if not file_path:
+        log("Backup cancelled")
+        return
+    try:
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(backup, f, indent=2)
+    except OSError as e:
+        log(f"Backup save error: {e}")
+        return
+    log(f"{port}: settings saved to {file_path}")
+
+
+def action_write_module_settings_v17():
+    """Restore a backup onto a module that has been re-flashed with v1.17."""
+    port = state["selected_port"]
+    if not port:
+        log("No serial port selected")
+        return
+    protocol = _get_protocol()
+
+    file_path = filedialog.askopenfilename(
+        title="Open Module Settings JSON",
+        filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+    )
+    if not file_path:
+        return
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        expected, script_bytes, removed_lines = settings_backup.parse_backup(payload)
+    except (OSError, ValueError) as e:
+        log(f"Backup load error: {e}")
+        return
+    for removed in removed_lines:
+        log(f"Dropped script line not supported by v1.17: {removed}")
+    forced = settings_backup.apply_v17_defaults(expected)
+
+    current = _read_module(port, protocol)
+    if not current:
+        log(f"{port}: cannot reach module - aborting restore")
+        return
+    firmware_version = f"{current.firmware_ver_major}.{current.firmware_ver_minor}"
+    if firmware_version != "1.17":
+        log(f"{port}: warning - module reports firmware {firmware_version}, expected 1.17")
+    log(f"{port}: restoring F{expected.module_id} from {os.path.basename(file_path)}")
+    for note in forced:
+        log(f"{port}: {note}")
+
+    for what, address, data in settings_backup.settings_write_blocks(expected):
+        if not _write_registers(port, address, data, protocol, what):
+            log(f"{port}: restore aborted")
+            return
+
+    expected.control_store_settings_to_flash()
+    address, data = expected.serialize_control()
+    if not _write_registers(port, address, data, protocol, "store settings to flash"):
+        log(f"{port}: restore aborted")
+        return
+    log(f"{port}: settings written and stored to flash")
+
+    script_written = _restore_script(port, protocol, expected, script_bytes)
+
+    time.sleep(0.1)
+    verify = _read_module(port, protocol)
+    if not verify:
+        log(f"{port}: settings restored but read back failed - verify manually")
+        return
+    mismatched = settings_backup.verify_settings(expected, verify)
+    if mismatched:
+        log(f"{port}: verification mismatch on {', '.join(mismatched)}")
+    else:
+        log(f"{port}: verification passed")
+
+    log(
+        f"{port}: standby idle mode and the Blulog protocol take effect on the next reset - "
+        "power-cycle the module, then talk to it with the Blulog protocol selected"
+    )
+    if script_written:
+        log(f"{port}: migration complete")
+    else:
+        log(f"{port}: migration complete except for the script - see above")
+
+
+def _restore_script(port, protocol, expected, script_bytes):
+    """Upload the script and store it to flash. Returns False if it was skipped or failed."""
+    if not script_bytes:
+        log(f"{port}: backup holds no script - skipping script restore")
+        return False
+    if protocol == "blulog" and len(script_bytes) > BLULOG_MAX_PAYLOAD_SIZE:
+        log(
+            f"{port}: script is {len(script_bytes)} bytes and the Blulog protocol caps a frame at "
+            f"{BLULOG_MAX_PAYLOAD_SIZE} - re-run the script restore over the FaradaIC protocol"
+        )
+        return False
+
+    address = settings_backup.script_write_address()
+    if not _write_registers(port, address, script_bytes, protocol, "script"):
+        return False
+
+    expected.control_store_script_to_flash()
+    ctrl_address, ctrl_data = expected.serialize_control()
+    if not _write_registers(port, ctrl_address, ctrl_data, protocol, "store script to flash"):
+        return False
+    log(f"{port}: script ({len(script_bytes)} bytes) written and stored to flash")
+    return True
 
 
 def _flash_firmware(firmware_filename):
@@ -724,6 +930,17 @@ def _build_device_col(parent):
     ttk.Button(col, text="Run SHT40", command=action_run_sht40_measurement).pack(
         fill=tk.X, padx=4, pady=(0, 2)
     )
+
+    ttk.Separator(col, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=4, pady=4)
+    ttk.Label(col, text="Migration", font=SECTION_HEADER_FONT).pack(
+        padx=4, pady=(0, 4), anchor=tk.W
+    )
+    ttk.Button(
+        col, text="Get Module Settings v11", command=action_get_module_settings_v11
+    ).pack(fill=tk.X, padx=4, pady=(0, 2))
+    ttk.Button(
+        col, text="Write Module Settings v17", command=action_write_module_settings_v17
+    ).pack(fill=tk.X, padx=4, pady=(0, 2))
 
     ttk.Separator(col, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=4, pady=4)
     ttk.Label(col, text="Firmware", font=SECTION_HEADER_FONT).pack(

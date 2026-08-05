@@ -10,6 +10,7 @@ class Module:
         self.status = 0
         self.control = 0
         self.config = 0
+        self.config_firmware = 0
         self.firmware_ver_minor = 0
         self.firmware_ver_major = 0
         # Float (32-bit) fields
@@ -74,6 +75,7 @@ class Module:
             ("Status", f"0x{self.status:02X}"),
             ("Control", f"0x{self.control:02X}"),
             ("Config", f"0x{self.config:02X}"),
+            ("Config Firmware", f"0x{self.config_firmware:02X}"),
             ("Concentration", f"{self.concentration:.6f}"),
             ("Temperature", f"{self.temperature:.6f}"),
             ("Humidity", f"{self.humidity:.6f}"),
@@ -263,6 +265,8 @@ class Module:
         self.control = data[Registers.REG_CONTROL]
         self.status = data[Registers.REG_STATUS]
         self.config = data[Registers.REG_CONFIG]
+        # Reads back as 0 on firmware older than v1.17, where the register is reserved.
+        self.config_firmware = data[Registers.REG_CONFIG_FIRMWARE]
         self.firmware_ver_minor = data[Registers.REG_FIRMWARE_VER_LSB]
         self.firmware_ver_major = data[Registers.REG_FIRMWARE_VER_MSB]
         # Floats
@@ -561,6 +565,11 @@ class Module:
         """Serialize config register (single byte at REG_CONFIG)."""
         buffer = bytearray([int(self.config) & 0xFF])
         return Registers.REG_CONFIG, list(buffer)
+
+    def serialize_config_firmware(self):
+        """Serialize firmware config register (single byte at REG_CONFIG_FIRMWARE)."""
+        buffer = bytearray([int(self.config_firmware) & 0xFF])
+        return Registers.REG_CONFIG_FIRMWARE, list(buffer)
 
     def serialize_module_config(self):
         """Serialize module configuration: module_id, gain, zero_offset."""
