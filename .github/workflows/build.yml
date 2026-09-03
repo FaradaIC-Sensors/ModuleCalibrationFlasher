@@ -1,0 +1,126 @@
+name: Build executables
+
+# Builds on GitHub's free runners, so no Windows machine is needed locally.
+# PyInstaller cannot cross-compile: each platform's binary is built on its own runner.
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]          # tagging v0.5 also publishes a Release
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}   # lets you build on demand from the Actions tab
+
+permissions:
+  contents: write         # needed only by the release job
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false    # a failure on one platform must not cancel the other
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            ext: ".exe"
+          - os: ubuntu-latest
+            platform: linux
+            ext: ""
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # The app is Tkinter-based. Fail here with a clear message rather than
+      # letting PyInstaller produce a binary that dies on launch.
+      - name: Check Tkinter is available
+        shell: bash
+        run: python -c "import tkinter; print('tkinter', tkinter.TkVersion)"
+
+      # APP_VERSION in main.py is the single source of truth for the version.
+      # Reading it here keeps the artifact name from drifting out of sync.
+      - name: Read app version
+        id: ver
+        shell: bash
+        run: |
+          version=$(grep -oP '^APP_VERSION\s*=\s*"\K[^"]+' main.py)
+          if [ -z "$version" ]; then echo "APP_VERSION not found in main.py"; exit 1; fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building version $version for ${{ matrix.platform }}"
+
+      - name: Build executable
+        run: >
+          pyinstaller main.py
+          --onefile
+          --noconsole
+          -n "ModuleCalibrationFlasher_v${{ steps.ver.outputs.version }}"
+
+      - name: Verify the binary was produced
+        shell: bash
+        run: |
+          bin="dist/ModuleCalibrationFlasher_v${{ steps.ver.outputs.version }}${{ matrix.ext }}"
+          test -f "$bin" || { echo "Expected $bin to exist"; ls -R dist; exit 1; }
+          echo "Built $bin ($(stat -c%s "$bin") bytes)"
+
+      # Zip on the runner so the download is one file per platform.
+      #
+      # Linux uses Info-ZIP `zip`, which stores Unix permissions so the binary stays
+      # executable after unzipping. 7z's zip writer does not reliably preserve that
+      # bit, and it is irrelevant on Windows.
+      - name: Create zip
+        shell: bash
+        run: |
+          name="ModuleCalibrationFlasher_v${{ steps.ver.outputs.version }}"
+          archive="${name}_${{ matrix.platform }}.zip"
+          if [ "${{ matrix.platform }}" = "windows" ]; then
+            ( cd dist && 7z a -tzip -mx=7 "../$archive" "${name}${{ matrix.ext }}" > /dev/null )
+          else
+            ( cd dist && zip -q -y "../$archive" "${name}${{ matrix.ext }}" )
+          fi
+          echo "Created $archive ($(stat -c%s "$archive") bytes)"
+
+      # The Linux binary must survive the round trip still executable, or users get
+      # "permission denied" after unzipping.
+      - name: Verify Linux binary stays executable
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          name="ModuleCalibrationFlasher_v${{ steps.ver.outputs.version }}"
+          rm -rf roundtrip && mkdir roundtrip
+          unzip -q "${name}_linux.zip" -d roundtrip
+          test -x "roundtrip/$name" || { echo "binary lost its executable bit in the zip"; ls -l roundtrip; exit 1; }
+          echo "executable bit preserved: $(stat -c '%A' "roundtrip/$name")"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ModuleCalibrationFlasher_v${{ steps.ver.outputs.version }}_${{ matrix.platform }}
+          path: ModuleCalibrationFlasher_v${{ steps.ver.outputs.version }}_${{ matrix.platform }}.zip
+          retention-days: 90
+
+  # Only runs when you push a tag like v0.5. Attaches both platforms' zips.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List collected artifacts
+        run: find artifacts -name '*.zip' -printf '%p (%s bytes)\n'
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*.zip
+          generate_release_notes: true

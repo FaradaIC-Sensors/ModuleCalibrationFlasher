@@ -7,6 +7,7 @@ import os
 import sys
 import subprocess
 import tkinter as tk
+from enum import IntEnum
 from tkinter import ttk, filedialog
 import serial.tools.list_ports
 
@@ -573,6 +574,7 @@ def action_read_info():
     log(f"ModuleId: {result.module_id}")
     log(f"Firmware Version: {result.firmware_ver_major}.{result.firmware_ver_minor}")
     log(f"Register Map Version: {result.register_map_ver_major}.{result.register_map_ver_minor}")
+    log(f"Idle Mode: {_idle_mode_label(result.config)} (REG_CONFIG 0x{result.config:02X})")
 
 
 def action_get_module_settings_v11():
@@ -805,6 +807,67 @@ def action_run_sht40_measurement():
         log("  Read back failed")
 
 
+class IdleMode(IntEnum):
+    """REG_CONFIG bit 0: how the module idles between measurements."""
+
+    SLEEP = 0
+    STANDBY = 1
+
+
+def _idle_mode_label(config):
+    if config & settings_backup.REG_CONFIG_IDLE_MODE_STANDBY_MASK:
+        return "Standby"
+    return "Sleep (STOP2)"
+
+
+def _set_idle_mode(mode):
+    """Write REG_CONFIG bit 0 and store it to flash, leaving the other config bits alone.
+
+    Read-modify-write: the UI only knows bit 0, but the firmware may define more.
+    Takes effect on the next reset - power-cycle the module afterwards.
+    """
+    port = state["selected_port"]
+    if not port:
+        log("No serial port selected")
+        return
+    protocol = _get_protocol()
+
+    current = _read_module(port, protocol)
+    if not current:
+        log(f"Set {_idle_mode_label(mode)} failed - cannot reach module")
+        return
+    previous_config = current.config & 0xFF
+
+    mask = settings_backup.REG_CONFIG_IDLE_MODE_STANDBY_MASK
+    if mode == IdleMode.STANDBY:
+        current.config = previous_config | mask
+    else:
+        current.config = previous_config & ~mask & 0xFF
+
+    address, data = current.serialize_config()
+    if not _write_registers(port, address, data, protocol, "config"):
+        return
+
+    current.control_store_settings_to_flash()
+    address, data = current.serialize_control()
+    if not _write_registers(port, address, data, protocol, "store settings to flash"):
+        return
+
+    log(f"{port}: config 0x{previous_config:02X} -> 0x{current.config:02X} stored to flash")
+    log(
+        f"{port}: {_idle_mode_label(current.config)} takes effect on the next reset - "
+        "power-cycle the module"
+    )
+
+
+def action_set_standby():
+    _set_idle_mode(IdleMode.STANDBY)
+
+
+def action_set_sleep():
+    _set_idle_mode(IdleMode.SLEEP)
+
+
 def action_start_measurement():
     port = state["selected_port"]
     if not port:
@@ -928,6 +991,12 @@ def _build_device_col(parent):
         fill=tk.X, padx=4, pady=(0, 2)
     )
     ttk.Button(col, text="Run SHT40", command=action_run_sht40_measurement).pack(
+        fill=tk.X, padx=4, pady=(0, 2)
+    )
+    ttk.Button(col, text="Set Standby", command=action_set_standby).pack(
+        fill=tk.X, padx=4, pady=(0, 2)
+    )
+    ttk.Button(col, text="Set Sleep", command=action_set_sleep).pack(
         fill=tk.X, padx=4, pady=(0, 2)
     )
 
