@@ -16,12 +16,12 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-APP_VERSION = "0.7"
+APP_VERSION = "0.8"
 APP_WINDOW_TITLE = f"FaradaIC Module Calibration Flasher v{APP_VERSION}"
 SECTION_HEADER_FONT = ("TkDefaultFont", 10, "bold")
 
 from module import Module
-from connection import send_frame
+from connection import PingMode, send_frame
 from client import (
     build_registers_read_frame,
     build_registers_write_frame,
@@ -196,7 +196,11 @@ def action_upload_calibration_all():
 
             addr, data = tmp.serialize_calibration_config()
             status, resp = send_frame(
-                port, build_registers_write_frame(addr, data, protocol), OPERATION_WRITE, protocol
+                port,
+                build_registers_write_frame(addr, data, protocol),
+                OPERATION_WRITE,
+                protocol,
+                _get_ping_mode(),
             )
             if not status:
                 code, name = _decode_nack(resp, protocol)
@@ -209,7 +213,11 @@ def action_upload_calibration_all():
             tmp.control_store_settings_to_flash()
             c_addr, c_data = tmp.serialize_control()
             status, resp = send_frame(
-                port, build_registers_write_frame(c_addr, c_data, protocol), OPERATION_WRITE, protocol
+                port,
+                build_registers_write_frame(c_addr, c_data, protocol),
+                OPERATION_WRITE,
+                protocol,
+                _get_ping_mode(),
             )
             if not status:
                 code, name = _decode_nack(resp, protocol)
@@ -240,11 +248,19 @@ state = {
     "discovered_devices": [],
     "device_listbox": None,
     "protocol_var": None,
+    "ping_var": None,
 }
 
 def _get_protocol():
     var = state.get("protocol_var")
     return var.get() if var else "faradaic"
+
+
+def _get_ping_mode():
+    var = state.get("ping_var")
+    if var and not var.get():
+        return PingMode.DISABLED
+    return PingMode.ENABLED
 
 
 FARADAIC_NACK_ERROR_MAP = {
@@ -437,7 +453,7 @@ def _read_registers(port, address, length, protocol):
     except ValueError as e:
         return None, str(e)
 
-    status, response = send_frame(port, request, OPERATION_READ, protocol)
+    status, response = send_frame(port, request, OPERATION_READ, protocol, _get_ping_mode())
     if not status:
         code, name = _decode_nack(response, protocol)
         if name:
@@ -478,7 +494,7 @@ def _write_registers(port, address, data, protocol, what):
         log(f"{port}: {what} write failed - {e}")
         return False
 
-    status, response = send_frame(port, request, OPERATION_WRITE, protocol)
+    status, response = send_frame(port, request, OPERATION_WRITE, protocol, _get_ping_mode())
     if status:
         return True
     code, name = _decode_nack(response, protocol)
@@ -575,6 +591,27 @@ def action_read_info():
     log(f"Firmware Version: {result.firmware_ver_major}.{result.firmware_ver_minor}")
     log(f"Register Map Version: {result.register_map_ver_major}.{result.register_map_ver_minor}")
     log(f"Idle Mode: {_idle_mode_label(result.config)} (REG_CONFIG 0x{result.config:02X})")
+
+
+DEVICE_ID_LENGTH = 4
+
+
+def action_read_device_id():
+    """Read only the 4 device-id bytes (0x7C..0x7F), no full register page."""
+    port = state["selected_port"]
+    if not port:
+        log("No serial port selected")
+        return
+
+    data, error = _read_registers(
+        port, Registers.REG_DEVICE_ID_LLSB, DEVICE_ID_LENGTH, _get_protocol()
+    )
+    if error:
+        log(error)
+        return
+
+    module_id = int.from_bytes(bytes(data), "little")
+    log(f"ModuleId: {module_id}")
 
 
 def action_get_module_settings_v11():
@@ -791,7 +828,11 @@ def action_run_sht40_measurement():
     tmp.control_start_sht40_measurement_set()
     addr, data = tmp.serialize_control()
     status, _ = send_frame(
-        port, build_registers_write_frame(addr, data, protocol), OPERATION_WRITE, protocol
+        port,
+        build_registers_write_frame(addr, data, protocol),
+        OPERATION_WRITE,
+        protocol,
+        _get_ping_mode(),
     )
     if not status:
         log("Failed to send SHT40 start control")
@@ -900,7 +941,11 @@ def action_start_measurement():
     tmp.control_start_measurement_set()
     addr, data = tmp.serialize_control()
     status, _ = send_frame(
-        port, build_registers_write_frame(addr, data, protocol), OPERATION_WRITE, protocol
+        port,
+        build_registers_write_frame(addr, data, protocol),
+        OPERATION_WRITE,
+        protocol,
+        _get_ping_mode(),
     )
     if not status:
         log("Failed to send measurement start control")
@@ -961,6 +1006,12 @@ def _build_fleet_col(parent):
         side=tk.LEFT
     )
 
+    ping_var = tk.BooleanVar(value=True)
+    state["ping_var"] = ping_var
+    ttk.Checkbutton(col, text="Ping before packet", variable=ping_var).pack(
+        padx=4, pady=(0, 4), anchor=tk.W
+    )
+
     ttk.Label(col, text="Calibration Operations", font=SECTION_HEADER_FONT).pack(
         padx=4, pady=(4, 4), anchor=tk.W
     )
@@ -1007,6 +1058,9 @@ def _build_device_col(parent):
     )
 
     ttk.Button(col, text="Read Info", command=action_read_info).pack(
+        fill=tk.X, padx=4, pady=(0, 2)
+    )
+    ttk.Button(col, text="Read Device ID", command=action_read_device_id).pack(
         fill=tk.X, padx=4, pady=(0, 2)
     )
     ttk.Button(col, text="Run O2 Conc", command=action_start_measurement).pack(

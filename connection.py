@@ -1,5 +1,6 @@
 import serial
 import time
+from enum import IntEnum
 
 from client import build_empty_read_frame
 from protocol import (
@@ -34,6 +35,13 @@ PING_SETTLE_TIME_S = 0.01
 BLULOG_MAX_ATTEMPTS = 3
 BLULOG_EMPTY_RETRY_DELAY_S = 0.05
 BLULOG_READY_RETRY_DELAY_S = 0.02
+
+
+class PingMode(IntEnum):
+    """Whether a transaction wakes the device with a ping before the main frame."""
+
+    DISABLED = 0
+    ENABLED = 1
 
 
 def _read_ping_response(ser):
@@ -157,7 +165,7 @@ def ping_module(port, protocol="faradaic"):
         return False
 
 
-def send_frame(port, frame, operation, protocol="faradaic"):
+def send_frame(port, frame, operation, protocol="faradaic", ping=PingMode.ENABLED):
     try:
         with serial.Serial(port, SERIAL_BAUD, timeout=SERIAL_TIMEOUT_S) as ser:
             if protocol == "blulog":
@@ -169,11 +177,13 @@ def send_frame(port, frame, operation, protocol="faradaic"):
                     return True, response_bytes
                 return False, response_bytes
 
-            # Wake the device with a ping first
-            if not _send_ping(ser):
-                return False, []
+            # Wake the device with a ping first. Skipping it checks whether the
+            # device answers unprompted, e.g. while it stays awake in standby.
+            if ping == PingMode.ENABLED:
+                if not _send_ping(ser):
+                    return False, []
 
-            time.sleep(PING_SETTLE_TIME_S)
+                time.sleep(PING_SETTLE_TIME_S)
 
             # Now send the actual command
             ser.reset_input_buffer()
