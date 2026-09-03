@@ -33,7 +33,7 @@ from protocol import (
     blulog_process_frame,
     process_frame,
 )
-from registers import REGISTERS_PAGE_SIZE
+from registers import REGISTERS_PAGE_SIZE, Registers
 import settings_backup
 
 
@@ -820,21 +820,41 @@ def _idle_mode_label(config):
     return "Sleep (STOP2)"
 
 
+# REG_CONTROL (0x04) and REG_CONFIG (0x24) must travel in ONE write frame: the
+# firmware acts on the store-settings bit in the same handler that parsed the new
+# config byte, so the flash write finishes before the module can idle out.
+#
+#   0x04    0x05 ................. 0x23     0x24
+#   CONTROL |  read-only, echoed back  |   CONFIG
+#
+# Split across two frames, the module enters Standby on the ~100 ms idle timeout
+# after frame A's ACK - it only wakes on a rising edge on EN, never on UART - so
+# frame B never lands and the unstored bit is lost on the wake-up reset.
+IDLE_MODE_BLOCK_START = Registers.REG_CONTROL
+IDLE_MODE_BLOCK_END = Registers.REG_CONFIG
+
+
 def _set_idle_mode(mode):
     """Write REG_CONFIG bit 0 and store it to flash, leaving the other config bits alone.
 
     Read-modify-write: the UI only knows bit 0, but the firmware may define more.
-    Takes effect on the next reset - power-cycle the module afterwards.
     """
     port = state["selected_port"]
     if not port:
         log("No serial port selected")
         return
     protocol = _get_protocol()
+    target_label = _idle_mode_label(mode)
 
-    current = _read_module(port, protocol)
-    if not current:
-        log(f"Set {_idle_mode_label(mode)} failed - cannot reach module")
+    page, error = _read_register_page(port, protocol)
+    if error:
+        log(error)
+        log(f"Set {target_label} failed - cannot reach module")
+        return
+
+    current = Module()
+    if not current.deserialize(page):
+        log(f"Set {target_label} failed - deserialization error")
         return
     previous_config = current.config & 0xFF
 
@@ -844,20 +864,22 @@ def _set_idle_mode(mode):
     else:
         current.config = previous_config & ~mask & 0xFF
 
-    address, data = current.serialize_config()
-    if not _write_registers(port, address, data, protocol, "config"):
-        return
-
+    # The registers between CONTROL and CONFIG are read-only and ignore writes, so
+    # the block hands them straight back as they were just read.
+    block = list(page[IDLE_MODE_BLOCK_START : IDLE_MODE_BLOCK_END + 1])
     current.control_store_settings_to_flash()
-    address, data = current.serialize_control()
-    if not _write_registers(port, address, data, protocol, "store settings to flash"):
+    block[0] = current.control & 0xFF
+    block[-1] = current.config
+
+    if not _write_registers(port, IDLE_MODE_BLOCK_START, block, protocol, "config"):
         return
 
     log(f"{port}: config 0x{previous_config:02X} -> 0x{current.config:02X} stored to flash")
-    log(
-        f"{port}: {_idle_mode_label(current.config)} takes effect on the next reset - "
-        "power-cycle the module"
-    )
+    if mode == IdleMode.STANDBY:
+        log(
+            f"{port}: the module idles into Standby ~100 ms from now and wakes only on a "
+            "rising edge on EN - with EN unwired it stops answering UART"
+        )
 
 
 def action_set_standby():
